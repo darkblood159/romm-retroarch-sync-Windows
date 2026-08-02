@@ -1,0 +1,25 @@
+# Windows requirements for RomM-RetroArch Sync
+#
+#   pip install -r requirements-windows.txt
+#
+# This does NOT include GTK4 / PyGObject / libadwaita — those aren't
+# pip-installable in the ordinary sense on Windows. They come from gvsbuild
+# (see WINDOWS_PORT_NOTES.md): the C libraries need to be on PATH, and
+# PyGObject/pycairo get installed into this same venv from the .whl files
+# gvsbuild generates (`gvsbuild build --enable-gi --py-wheel ...`) —
+# packaging/build_windows.ps1 finds and installs those automatically.
+# Everything below is a normal pip install once that's in place.
+
+# The sync engine, vendored locally under engine/ instead of pulled from the
+# private Ludo repo the Linux build uses — this keeps the Windows build
+# self-contained and buildable by anyone with this folder, no repo access
+# needed. Installed editable so engine/ and src/ stay in sync during dev.
+-e ./engine
+
+# Windows-only additions on top of what the engine's own pyproject.toml
+# already pulls in (requests, watchdog, cryptography, Pillow, psutil, py7zr):
+pystray>=0.19.5        # native Win32 tray icon (Shell_NotifyIcon), replaces AppIndicator3
+winotify>=1.1.0         # native Windows 10/11 toast notifications
+
+# Packaging
+pyinstaller>=6.3.0

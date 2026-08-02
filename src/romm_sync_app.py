@@ -4,11 +4,13 @@ import gi
 import requests
 import json
 import os
+import sys
 import shutil
 import threading
 import pickle
 import time
 import logging
+import platform
 from pathlib import Path
 from urllib.parse import urljoin, quote
 import socket
@@ -16,6 +18,42 @@ import configparser
 import html
 import webbrowser
 import base64
+
+# Make stdout/stderr safe to print() to, before anything else in this file
+# does. This has bitten this app in two different ways on Windows:
+#  - This file logs with print() throughout, including emoji (rocket ships,
+#    checkmarks, etc.). Windows' default stdio encoding for a *redirected*
+#    stream (a file, `*>`/`>` in PowerShell, a pipe) is commonly a legacy
+#    single-byte code page like cp1252 rather than UTF-8, which can't
+#    represent them -- crashing with UnicodeEncodeError on the very first
+#    emoji print, which in practice means almost immediately.
+#  - A windowed (console=False) PyInstaller build has no console at all, so
+#    sys.stdout/sys.stderr can be None outright; print() would then crash
+#    with AttributeError instead of a window ever appearing, with nothing
+#    visible anywhere to explain why.
+class _SafeNullStream:
+    """Absorbs writes when there's genuinely no stdout/stderr to send them
+    to (a windowed build with no console attached), so print() is a no-op
+    instead of a crash."""
+    def write(self, *args, **kwargs):
+        pass
+
+    def flush(self):
+        pass
+
+    def isatty(self):
+        return False
+
+
+for _stream_name in ('stdout', 'stderr'):
+    _stream = getattr(sys, _stream_name, None)
+    if _stream is None:
+        setattr(sys, _stream_name, _SafeNullStream())
+    elif hasattr(_stream, 'reconfigure'):
+        try:
+            _stream.reconfigure(encoding='utf-8', errors='replace')
+        except Exception:
+            pass
 import datetime
 from datetime import timezone
 import psutil
@@ -27,11 +65,14 @@ from watchdog.events import FileSystemEventHandler
 import queue
 from collections import defaultdict
 
-# Fix SSL certificate path for AppImage environment
-# Use system certificates instead of bundled certifi
+# Fix SSL certificate path for AppImage environment (Linux only — this path
+# doesn't exist on Windows, and overriding it there breaks every HTTPS
+# request since requests/urllib3 would have no CA bundle to fall back on).
+# Use system certificates instead of bundled certifi.
 import ssl
-os.environ['REQUESTS_CA_BUNDLE'] = '/etc/ssl/certs/ca-certificates.crt'
-os.environ['SSL_CERT_FILE'] = '/etc/ssl/certs/ca-certificates.crt'
+if platform.system() == 'Linux' and os.path.exists('/etc/ssl/certs/ca-certificates.crt'):
+    os.environ['REQUESTS_CA_BUNDLE'] = '/etc/ssl/certs/ca-certificates.crt'
+    os.environ['SSL_CERT_FILE'] = '/etc/ssl/certs/ca-certificates.crt'
 
 gi.require_version('Gtk', '4.0')
 
@@ -507,12 +548,24 @@ except ValueError:
 from romm_sync_engine.sync_core import *
 
 class TrayIcon:
-    """Cross-desktop tray icon using subprocess for AppIndicator"""
-    
+    """Cross-platform tray icon.
+
+    Linux: unchanged from before — a subprocess running GTK3 + AppIndicator3
+    (AppIndicator/StatusNotifierItem has no GTK4 equivalent, and mixing GTK3
+    and GTK4 in one process isn't supported), signaled via SIGUSR1/SIGTERM.
+
+    Windows: AppIndicator3 doesn't exist there at all, and there's no reason
+    to pay for a second process — pystray talks to the native Win32 tray
+    (Shell_NotifyIcon) directly from a background thread in the same
+    process, and its menu callbacks hand off to the GTK main loop via
+    GLib.idle_add instead of OS signals (Windows Python has no SIGUSR1).
+    """
+
     def __init__(self, app, window):
         self.app = app
         self.window = window
         self.tray_process = None
+        self.tray_icon = None  # pystray.Icon, Windows only
         self.desktop = self.detect_desktop()
         self.setup_tray()
     
@@ -524,30 +577,38 @@ class TrayIcon:
         elif 'kde' in desktop_env:
             return 'kde'
         return 'other'
-    
-    def setup_tray(self):
-        """Setup tray icon using subprocess"""
-        import subprocess
-        import sys
-        import os
-        
-        # Get the correct icon path for the new structure
+
+    def _find_icon_path(self):
+        """Locate the tray icon PNG, checked from the app dir, an AppImage
+        mount, next to the script, or (frozen Windows build) the PyInstaller
+        bundle dir."""
         script_dir = os.path.dirname(os.path.abspath(__file__))
         project_root = os.path.dirname(script_dir)
-        
-        # Try multiple icon locations
         icon_locations = [
             os.path.join(project_root, 'assets', 'icons', 'romm_icon.png'),
             os.path.join(os.environ.get('APPDIR', ''), 'usr/bin/romm_icon.png'),
             os.path.join(script_dir, 'romm_icon.png'),
-            'romm_icon.png'
+            'romm_icon.png',
         ]
-        
-        custom_icon_path = None
+        if hasattr(sys, '_MEIPASS'):  # PyInstaller bundle (onefile or onedir)
+            icon_locations.insert(0, os.path.join(sys._MEIPASS, 'assets', 'icons', 'romm_icon.png'))
         for location in icon_locations:
-            if os.path.exists(location):
-                custom_icon_path = location
-                break
+            if location and os.path.exists(location):
+                return location
+        return None
+
+    def setup_tray(self):
+        """Setup tray icon for the current platform."""
+        if platform.system() == 'Windows':
+            self.setup_tray_windows()
+        else:
+            self.setup_tray_linux()
+
+    def setup_tray_linux(self):
+        """Setup tray icon using subprocess (GTK3 + AppIndicator3)"""
+        import subprocess
+        
+        custom_icon_path = self._find_icon_path()
         
         # Create the tray script content with corrected icon path
         tray_script = f'''import gi
@@ -626,13 +687,64 @@ if __name__ == "__main__":
             
         except Exception as e:
             print(f"❌ Tray setup failed: {e}")
+
+    def setup_tray_windows(self):
+        """Setup tray icon using pystray (native Win32 Shell_NotifyIcon),
+        running in-process on a background thread — no subprocess, no
+        Unix signals, just direct callbacks marshalled onto the GTK loop."""
+        try:
+            import pystray
+            from PIL import Image, ImageDraw
+        except ImportError as e:
+            print(f"❌ Tray setup failed: pystray/Pillow not available: {e}")
+            print("💡 Install with: pip install pystray")
+            return
+
+        icon_path = self._find_icon_path()
+        if icon_path:
+            try:
+                image = Image.open(icon_path)
+            except Exception as e:
+                print(f"⚠️ Could not load tray icon image, using fallback: {e}")
+                image = self._fallback_icon_image(Image, ImageDraw)
+        else:
+            print("⚠️ No tray icon file found, using generated fallback")
+            image = self._fallback_icon_image(Image, ImageDraw)
+
+        def on_toggle_clicked(icon, item):
+            GLib.idle_add(self.on_toggle_window)
+
+        def on_quit_clicked(icon, item):
+            GLib.idle_add(self.on_quit)
+
+        menu = pystray.Menu(
+            pystray.MenuItem("Show/Hide Window", on_toggle_clicked, default=True),
+            pystray.MenuItem("Quit", on_quit_clicked),
+        )
+        self.tray_icon = pystray.Icon("romm-retroarch-sync", image, "RomM - RetroArch Sync", menu)
+
+        # pystray's run() blocks, so it needs its own thread; GTK stays on
+        # the main thread. detach=False + a daemon thread means it dies
+        # cleanly with the process if cleanup() is ever skipped.
+        self._tray_thread = threading.Thread(target=self.tray_icon.run, daemon=True)
+        self._tray_thread.start()
+
+    @staticmethod
+    def _fallback_icon_image(Image, ImageDraw):
+        """A simple generated icon for when no icon file can be found, so
+        the tray never fails to appear just because an asset is missing."""
+        size = 64
+        img = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        draw.ellipse((4, 4, size - 4, size - 4), fill=(94, 92, 230, 255))
+        return img
     
     def _on_toggle_signal(self, signum, frame):
-        """Handle toggle signal from tray"""
+        """Handle toggle signal from tray (Linux only)"""
         GLib.idle_add(self.on_toggle_window)
     
     def _on_quit_signal(self, signum, frame):
-        """Handle quit signal from tray"""
+        """Handle quit signal from tray (Linux only)"""
         GLib.idle_add(self.on_quit)
     
     def on_toggle_window(self):
@@ -655,10 +767,16 @@ if __name__ == "__main__":
             print(f"❌ Quit error: {e}")
     
     def cleanup(self):
-        """Clean up tray process"""
+        """Clean up tray process/thread"""
         if self.tray_process:
             self.tray_process.terminate()
             print("✅ Tray icon cleaned up")
+        if self.tray_icon:
+            try:
+                self.tray_icon.stop()
+                print("✅ Tray icon cleaned up")
+            except Exception as e:
+                print(f"⚠️ Tray icon stop error: {e}")
         
 class GameItem(GObject.Object):
     def __init__(self, game_data):
@@ -7268,6 +7386,15 @@ class SyncWindow(Gtk.ApplicationWindow):
         self.download_queue = []
         self.available_games = []  # Initialize games list
 
+        # Additional ROM search directories (existing libraries organized
+        # however the user already has them). Empty dict so lookups before
+        # the first scan completes are harmless no-ops rather than
+        # AttributeErrors; populated for real on a background thread below
+        # if anything's configured from a previous session.
+        self._extra_rom_index = {}
+        if self._get_extra_search_dirs():
+            GLib.idle_add(lambda: self.rebuild_extra_rom_index(rescan=False))
+
         # Timestamps for efficient polling with updated_after parameter
         self._last_full_fetch_time = None  # ISO 8601 datetime of last full data fetch
 
@@ -7737,6 +7864,13 @@ class SyncWindow(Gtk.ApplicationWindow):
             self.log_message("✅ Debug mode disabled")
 
     def create_systemd_service(self):
+        """Create OS-native autostart entry (systemd on Linux, Task Scheduler
+        on Windows). Name kept for compatibility with existing call sites."""
+        if platform.system() == 'Windows':
+            return self._create_autostart_windows()
+        return self._create_autostart_linux()
+
+    def _create_autostart_linux(self):
         """Create systemd user service for autostart"""
         import subprocess
         import os
@@ -7792,7 +7926,98 @@ class SyncWindow(Gtk.ApplicationWindow):
             print(f"Failed to create systemd service: {e}")
             return False
 
+    _WINDOWS_TASK_NAME = 'RomM-RetroArch-Sync'
+
+    def _windows_autostart_command(self):
+        """(quoted exe path, arguments) for the current run mode — frozen
+        PyInstaller exe vs. a plain .py script under python.exe."""
+        if hasattr(sys, '_MEIPASS'):  # PyInstaller-frozen exe: the exe IS the app
+            return f'"{sys.executable}"', '--minimized'
+        return f'"{sys.executable}"', f'"{os.path.abspath(__file__)}" --minimized'
+
+    def _create_autostart_windows(self):
+        """Create a Windows Task Scheduler task for autostart.
+
+        Mirrors the systemd unit as closely as Task Scheduler allows: runs
+        at logon with a startup delay, and restarts on failure. Uses the XML
+        task format instead of plain `schtasks /Create /SC ONLOGON` flags
+        because delay and restart-on-failure can only be expressed that way.
+        Note: Task Scheduler's minimum restart interval is 1 minute (the
+        systemd unit uses 10s) — that's a Task Scheduler limitation, not a
+        choice made here.
+        """
+        import subprocess
+        import tempfile
+
+        try:
+            exec_path, exec_args = self._windows_autostart_command()
+            task_xml = f'''<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <Delay>PT15S</Delay>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <RestartOnFailure>
+      <Interval>PT1M</Interval>
+      <Count>3</Count>
+    </RestartOnFailure>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{exec_path}</Command>
+      <Arguments>{exec_args}</Arguments>
+    </Exec>
+  </Actions>
+</Task>'''
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.xml', delete=False, encoding='utf-16') as f:
+                f.write(task_xml)
+                xml_path = f.name
+
+            try:
+                result = subprocess.run(
+                    ['schtasks', '/Create', '/TN', self._WINDOWS_TASK_NAME, '/XML', xml_path, '/F'],
+                    capture_output=True, text=True
+                )
+                if result.returncode != 0:
+                    print(f"Failed to create scheduled task: {result.stderr}")
+                    return False
+            finally:
+                try:
+                    os.unlink(xml_path)
+                except OSError:
+                    pass
+
+            self.settings.set('System', 'autostart', 'true')
+            self.settings.set('System', 'autostart_exec_path', exec_path)
+            return True
+
+        except Exception as e:
+            print(f"Failed to create scheduled task: {e}")
+            return False
+
     def remove_systemd_service(self):
+        """Remove OS-native autostart entry."""
+        if platform.system() == 'Windows':
+            return self._remove_autostart_windows()
+        return self._remove_autostart_linux()
+
+    def _remove_autostart_linux(self):
         """Remove systemd user service"""
         import subprocess
         from pathlib import Path
@@ -7819,7 +8044,28 @@ class SyncWindow(Gtk.ApplicationWindow):
             print(f"Failed to remove systemd service: {e}")
             return False
 
+    def _remove_autostart_windows(self):
+        """Remove the Windows Task Scheduler autostart task."""
+        import subprocess
+        try:
+            subprocess.run(
+                ['schtasks', '/Delete', '/TN', self._WINDOWS_TASK_NAME, '/F'],
+                capture_output=True
+            )
+            self.settings.set('System', 'autostart', 'false')
+            return True
+        except Exception as e:
+            print(f"Failed to remove scheduled task: {e}")
+            return False
+
     def update_systemd_service_if_needed(self):
+        """Update the autostart entry if the current executable path differs
+        from what was last registered (e.g. after an update moved the app)."""
+        if platform.system() == 'Windows':
+            return self._update_autostart_windows_if_needed()
+        return self._update_autostart_linux_if_needed()
+
+    def _update_autostart_linux_if_needed(self):
         """Update systemd service if current executable differs from service file"""
         try:
             import subprocess
@@ -7862,13 +8108,54 @@ class SyncWindow(Gtk.ApplicationWindow):
             self.log_message(f"❌ Service update check failed: {e}")
             return False
 
+    def _update_autostart_windows_if_needed(self):
+        """Update the scheduled task if the current executable differs from
+        what was last registered."""
+        try:
+            if not self._check_autostart_windows():
+                return False
+
+            current_exec, _ = self._windows_autostart_command()
+            last_exec = self.settings.get('System', 'autostart_exec_path', '')
+
+            if current_exec != last_exec:
+                self.log_message("🔄 Updating autostart task for new version...")
+                success = self._create_autostart_windows()
+                if success:
+                    self.log_message("✅ Autostart task updated")
+                    return True
+                else:
+                    self.log_message("❌ Failed to update autostart task")
+
+            return False
+
+        except Exception as e:
+            self.log_message(f"❌ Task update check failed: {e}")
+            return False
+
     def check_autostart_status(self):
         """Check if autostart is currently enabled"""
+        if platform.system() == 'Windows':
+            return self._check_autostart_windows()
+        return self._check_autostart_linux()
+
+    def _check_autostart_linux(self):
         import subprocess
         try:
             result = subprocess.run(['systemctl', '--user', 'is-enabled', 'romm-retroarch-sync.service'], 
                                 capture_output=True, text=True)
             return result.returncode == 0 and 'enabled' in result.stdout
+        except Exception:
+            return False
+
+    def _check_autostart_windows(self):
+        import subprocess
+        try:
+            result = subprocess.run(
+                ['schtasks', '/Query', '/TN', self._WINDOWS_TASK_NAME],
+                capture_output=True, text=True
+            )
+            return result.returncode == 0
         except Exception:
             return False
 
@@ -8088,6 +8375,16 @@ class SyncWindow(Gtk.ApplicationWindow):
                             break
             except (OSError, PermissionError):
                 pass
+
+        # Still not found in the managed download folder? Check the
+        # additional search directories (an existing library organized
+        # however the user already has it, e.g. a LaunchBox collection),
+        # if any are configured.
+        if not is_downloaded and hasattr(self, 'find_in_extra_rom_index'):
+            found = self.find_in_extra_rom_index(file_name, rom.get('name', ''))
+            if found and self.is_path_validly_downloaded(found):
+                local_path = found
+                is_downloaded = True
 
         display_name = Path(file_name).stem if file_name else rom.get('name', 'Unknown')
 
@@ -8331,6 +8628,35 @@ class SyncWindow(Gtk.ApplicationWindow):
         else:
             self.log_message("RetroArch path override cleared, using auto-detection")
 
+    def on_browse_retroarch_executable(self, button):
+        """Browse for the RetroArch executable directly, instead of hand-typing
+        a path -- sidesteps any ambiguity about whether a folder or the exe
+        itself is expected, and is the more familiar flow on Windows."""
+        dialog = Gtk.FileDialog()
+        dialog.set_title("Select RetroArch Executable")
+
+        if platform.system() == 'Windows':
+            exe_filter = Gtk.FileFilter()
+            exe_filter.set_name("RetroArch executable (retroarch.exe)")
+            exe_filter.add_pattern("retroarch.exe")
+            exe_filter.add_pattern("*.exe")
+            filter_list = Gio.ListStore.new(Gtk.FileFilter)
+            filter_list.append(exe_filter)
+            dialog.set_filters(filter_list)
+            dialog.set_default_filter(exe_filter)
+
+        def on_response(source, result):
+            try:
+                file = dialog.open_finish(result)
+                if file:
+                    path = file.get_path()
+                    self.retroarch_override_row.set_text(path)
+                    self.on_retroarch_override_changed(self.retroarch_override_row)
+            except Exception:
+                pass  # User cancelled or error occurred
+
+        dialog.open(self, None, on_response)
+
     def on_device_name_changed(self, entry_row):
         """Handle device name change"""
         new_name = entry_row.get_text().strip()
@@ -8507,7 +8833,7 @@ class SyncWindow(Gtk.ApplicationWindow):
 
             # Add custom CSS - using very specific targeting
             css_provider = Gtk.CssProvider()
-            css_provider.load_from_data(b"""
+            _custom_css = b"""
             /* Mission Center-inspired styling with system font */
             .data-table {
                 background: @view_bg_color;
@@ -8599,7 +8925,20 @@ class SyncWindow(Gtk.ApplicationWindow):
                 padding: 4px;
                 margin: 0;
             }
-            """)
+            """
+            # load_from_string() is the modern GTK 4.12+ API and unambiguous
+            # (one argument, no length). load_from_data()'s argument count
+            # differs by GTK/PyGObject version: some auto-compute the length
+            # from the bytes, some (seen on GTK 4.22) require it explicitly.
+            # Preferring load_from_string when available sidesteps that
+            # version gap; the fallback still handles both load_from_data forms.
+            if hasattr(css_provider, 'load_from_string'):
+                css_provider.load_from_string(_custom_css.decode('utf-8'))
+            else:
+                try:
+                    css_provider.load_from_data(_custom_css)
+                except TypeError:
+                    css_provider.load_from_data(_custom_css, len(_custom_css))
             Gtk.StyleContext.add_provider_for_display(
                 self.get_display(),
                 css_provider,
@@ -8984,6 +9323,19 @@ class SyncWindow(Gtk.ApplicationWindow):
         self.retroarch_override_row.set_title("Custom Installation Path (Override auto-detection)")
         self.retroarch_override_row.set_text(self.settings.get('RetroArch', 'custom_path', ''))
         self.retroarch_override_row.connect('activate', self.on_retroarch_override_changed)
+        # Also save on focus-loss, not just Enter -- typing a path and then
+        # clicking elsewhere (instead of pressing Enter) is at least as
+        # natural, and previously just silently discarded whatever was typed.
+        _retroarch_override_focus = Gtk.EventControllerFocus()
+        _retroarch_override_focus.connect(
+            'leave', lambda *_: self.on_retroarch_override_changed(self.retroarch_override_row)
+        )
+        self.retroarch_override_row.add_controller(_retroarch_override_focus)
+        retroarch_browse_button = Gtk.Button(icon_name="document-open-symbolic")
+        retroarch_browse_button.set_valign(Gtk.Align.CENTER)
+        retroarch_browse_button.set_tooltip_text("Browse for retroarch.exe / retroarch")
+        retroarch_browse_button.connect("clicked", self.on_browse_retroarch_executable)
+        self.retroarch_override_row.add_suffix(retroarch_browse_button)
         self.retroarch_expander.add_row(self.retroarch_override_row)
 
         # Cores directory row
@@ -9844,6 +10196,51 @@ class SyncWindow(Gtk.ApplicationWindow):
 
         config_group.add(library_dir_expander)
 
+        # Additional Search Directories -- for recognizing ROMs that
+        # already exist somewhere else (e.g. an existing LaunchBox/Emulation
+        # library), instead of only ever looking in the managed download
+        # folder. Recursively scanned, arbitrary nesting depth, independent
+        # of RomM's own platform-slug/filename folder convention.
+        extra_dirs_expander = Adw.ExpanderRow()
+        extra_dirs_expander.set_title("Additional Search Directories")
+        extra_dirs_expander.set_subtitle("Also look for already-owned ROMs in these folders (and their subfolders)")
+
+        extra_add_button_container = Gtk.Box()
+        extra_add_button_container.set_size_request(-1, 18)
+        extra_add_button_container.set_valign(Gtk.Align.CENTER)
+        extra_add_button = Gtk.Button(label="Add Folder...")
+        extra_add_button.connect('clicked', self.on_add_extra_search_dir)
+        extra_add_button.set_size_request(100, -1)
+        extra_add_button.set_valign(Gtk.Align.CENTER)
+        extra_add_button_container.append(extra_add_button)
+        extra_dirs_expander.add_suffix(extra_add_button_container)
+
+        extra_dirs_path_row = Adw.EntryRow()
+        extra_dirs_path_row.set_title("Folders (one per line pasted, or | separated)")
+        extra_dirs_path_row.set_text(self.settings.get('Library', 'extra_search_dirs', ''))
+        extra_dirs_path_row.connect('activate', self.on_extra_search_dirs_changed)
+        _extra_dirs_focus = Gtk.EventControllerFocus()
+        _extra_dirs_focus.connect(
+            'leave', lambda *_: self.on_extra_search_dirs_changed(extra_dirs_path_row)
+        )
+        extra_dirs_path_row.add_controller(_extra_dirs_focus)
+        self._extra_dirs_path_row = extra_dirs_path_row
+        extra_dirs_expander.add_row(extra_dirs_path_row)
+
+        extra_dirs_status_row = Adw.ActionRow()
+        extra_dirs_status_row.set_title("Index status")
+        extra_dirs_status_row.set_subtitle("Not scanned yet")
+        self._extra_dirs_status_row = extra_dirs_status_row
+        rescan_button_container = Gtk.Box()
+        rescan_button_container.set_valign(Gtk.Align.CENTER)
+        rescan_button = Gtk.Button(label="Rescan")
+        rescan_button.connect('clicked', lambda *_: self.rebuild_extra_rom_index(rescan=True))
+        rescan_button_container.append(rescan_button)
+        extra_dirs_status_row.add_suffix(rescan_button_container)
+        extra_dirs_expander.add_row(extra_dirs_status_row)
+
+        config_group.add(extra_dirs_expander)
+
         # BIOS Files settings
         bios_expander = Adw.ExpanderRow()
         bios_expander.set_title("System BIOS Files")
@@ -9967,11 +10364,57 @@ class SyncWindow(Gtk.ApplicationWindow):
         GLib.idle_add(update_ui)
 
     def send_desktop_notification(self, title, body):
-        """Send a desktop notification (GNOME/KDE/etc)"""
+        """Send a desktop notification (GNOME/KDE/Windows)"""
         import subprocess
         import os
 
         try:
+            if platform.system() == 'Windows':
+                # Method 1: native Windows 10/11 toast via winotify. Doesn't
+                # depend on the GTK4/GLib stack's own (less-tested-on-Windows)
+                # notification backend at all.
+                try:
+                    from winotify import Notification as WinNotification
+
+                    icon_path = ''
+                    try:
+                        icon_path = self._find_icon_path() if hasattr(self, '_find_icon_path') else ''
+                    except Exception:
+                        icon_path = ''
+
+                    toast = WinNotification(
+                        app_id="RomM - RetroArch Sync",
+                        title=title,
+                        msg=body,
+                        icon=icon_path or ''
+                    )
+                    toast.show()
+                    print(f"✅ Desktop notification sent (winotify): {title}")
+                    return True
+                except ImportError:
+                    print("⚠️ winotify not installed, trying Gio.Notification...")
+                except Exception as e:
+                    print(f"⚠️ winotify error: {e}, trying Gio.Notification...")
+
+                # Method 2: Gio.Notification. GLib does have a native win32
+                # notification backend in recent versions, so this can work
+                # on its own — kept as the fallback in case winotify isn't
+                # bundled with a given build.
+                app = self.get_application()
+                if app and hasattr(app, 'send_notification'):
+                    try:
+                        notification = Gio.Notification.new(title)
+                        notification.set_body(body)
+                        notification_id = f"collection-sync-{hash(title) % 10000}"
+                        app.send_notification(notification_id, notification)
+                        print(f"✅ Sent Gio notification: {title}")
+                        return True
+                    except Exception as e:
+                        print(f"❌ Gio.Notification failed: {e}")
+
+                print(f"❌ All notification methods failed for: {title}")
+                return False
+
             # Method 1: Direct D-Bus call (most reliable for GNOME)
             try:
                 # Use gdbus to send notification directly to the notification daemon
@@ -10075,6 +10518,162 @@ class SyncWindow(Gtk.ApplicationWindow):
 
         dialog.select_folder(self, None, on_response)
 
+    def _get_extra_search_dirs(self):
+        """Parse the stored | or newline separated list into existing Path objects."""
+        raw = self.settings.get('Library', 'extra_search_dirs', '')
+        parts = [p.strip() for p in re.split(r'[|\n]', raw) if p.strip()]
+        dirs = []
+        for p in parts:
+            path = Path(p)
+            if path.is_dir() and path not in dirs:
+                dirs.append(path)
+        return dirs
+
+    def on_add_extra_search_dir(self, button):
+        """Browse for a folder to add to the additional-search-directories list."""
+        dialog = Gtk.FileDialog()
+        dialog.set_title("Add ROM Folder to Search")
+
+        def on_response(source, result):
+            try:
+                folder = dialog.select_folder_finish(result)
+                if not folder:
+                    return
+                path = folder.get_path()
+                existing = self.settings.get('Library', 'extra_search_dirs', '')
+                current = [p.strip() for p in existing.split('|') if p.strip()]
+                if path not in current:
+                    current.append(path)
+                new_value = '|'.join(current)
+                self.settings.set('Library', 'extra_search_dirs', new_value)
+                if hasattr(self, '_extra_dirs_path_row'):
+                    self._extra_dirs_path_row.set_text(new_value)
+                self.log_message(f"Added search folder: {path}")
+                self.rebuild_extra_rom_index(rescan=True)
+            except Exception:
+                pass  # User cancelled or error occurred
+
+        dialog.select_folder(self, None, on_response)
+
+    def on_extra_search_dirs_changed(self, entry_row):
+        """Save manually-edited additional-search-directories text and rescan."""
+        value = entry_row.get_text().strip()
+        self.settings.set('Library', 'extra_search_dirs', value)
+        self.rebuild_extra_rom_index(rescan=True)
+
+    def rebuild_extra_rom_index(self, rescan=False):
+        """(Re)build the filename -> [paths] index used to recognize ROMs
+        that already exist in the configured additional search folders,
+        however they happen to be organized/nested.
+
+        Runs on a background thread since a library like a full LaunchBox
+        collection can be tens of thousands of files; the index itself is
+        just an in-memory dict, rebuilt on startup (if any folders are
+        configured) and whenever the folder list changes or Rescan is
+        pressed, not on every single lookup.
+        """
+        search_dirs = self._get_extra_search_dirs()
+
+        if hasattr(self, '_extra_dirs_status_row'):
+            if not search_dirs:
+                self._extra_dirs_status_row.set_subtitle("No folders configured")
+                self._extra_rom_index = {}
+                return
+            self._extra_dirs_status_row.set_subtitle("Scanning...")
+
+        def scan():
+            index = {}
+            file_count = 0
+            try:
+                for root in search_dirs:
+                    for f in root.rglob('*'):
+                        try:
+                            if f.is_file():
+                                key = f.name.lower()
+                                index.setdefault(key, []).append(f)
+                                file_count += 1
+                        except (OSError, PermissionError):
+                            continue
+            except Exception as e:
+                GLib.idle_add(lambda: self.log_message(f"⚠️ Additional search directory scan error: {e}"))
+
+            def finish():
+                self._extra_rom_index = index
+                if hasattr(self, '_extra_dirs_status_row'):
+                    self._extra_dirs_status_row.set_subtitle(
+                        f"{file_count:,} files indexed across {len(search_dirs)} folder(s)"
+                    )
+                self.log_message(f"📚 Additional search directories: indexed {file_count:,} files")
+                if rescan:
+                    # A rescan implies the user wants this reflected now,
+                    # not just on the next full library refresh.
+                    self.refresh_download_status_from_extra_index()
+                return False
+
+            GLib.idle_add(finish)
+
+        threading.Thread(target=scan, daemon=True).start()
+
+    def refresh_download_status_from_extra_index(self):
+        """Re-check every currently-loaded game's download status against
+        the (freshly rebuilt) additional-directories index, so pressing
+        Rescan updates the library view without needing a full server
+        refetch."""
+        if not hasattr(self, 'available_games'):
+            return
+        changed = 0
+        for game in self.available_games:
+            if game.get('is_downloaded'):
+                continue
+            file_name = game.get('fs_name') or game.get('file_name')
+            if not file_name:
+                continue
+            found = self.find_in_extra_rom_index(file_name, game.get('name', ''))
+            if found:
+                game['is_downloaded'] = True
+                game['local_path'] = str(found)
+                changed += 1
+        if changed and hasattr(self, 'library_section'):
+            self.library_section.update_games_library(self.available_games)
+        if changed:
+            self.log_message(f"📚 Matched {changed} existing game(s) via additional search directories")
+
+    def find_in_extra_rom_index(self, file_name, game_name=''):
+        """Look up file_name in the additional-directories index.
+
+        A plain filename match can be ambiguous -- some platforms (Switch
+        NSP dumps organized by launchers being a common example) reuse
+        generic filenames like "game.nsp" across many different titles,
+        with the actual game identified by its containing folder instead.
+        So: a single unambiguous match is used directly; multiple matches
+        are disambiguated by checking whether the game's own name appears
+        in the candidate's parent folder name; if that still doesn't land
+        on exactly one candidate, this returns None rather than guessing,
+        since pointing at the wrong game's file is worse than not matching
+        at all.
+        """
+        index = getattr(self, '_extra_rom_index', None)
+        if not index or not file_name:
+            return None
+
+        candidates = index.get(file_name.lower())
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            return candidates[0]
+
+        if game_name:
+            normalized_name = re.sub(r'[^a-z0-9]', '', game_name.lower())
+            name_matches = []
+            for c in candidates:
+                normalized_parent = re.sub(r'[^a-z0-9]', '', c.parent.name.lower())
+                if normalized_name and normalized_name in normalized_parent:
+                    name_matches.append(c)
+            if len(name_matches) == 1:
+                return name_matches[0]
+
+        return None  # Ambiguous -- don't guess.
+
     def on_max_downloads_changed(self, spin_row, pspec):
         """Save max concurrent downloads setting"""
         self.settings.set('Download', 'max_concurrent', str(int(spin_row.get_value())))
@@ -10143,6 +10742,8 @@ class SyncWindow(Gtk.ApplicationWindow):
                             install_type = "Snap"
                         elif '.AppImage' in self.retroarch.retroarch_executable:
                             install_type = "AppImage"
+                        elif platform.system() == 'Windows':
+                            install_type = "Portable"
                         else:
                             install_type = "Native"
                         
@@ -12902,10 +13503,13 @@ class SyncWindow(Gtk.ApplicationWindow):
             launcher.launch(self, None, None)
             self.log_message(f"Opened {label.lower()}: {folder}")
         except Exception as e:
-            # Fall back to xdg-open if FileLauncher is unavailable.
-            import subprocess
+            # Fall back to a platform file-opener if FileLauncher is unavailable.
             try:
-                subprocess.run(['xdg-open', str(folder)], check=True)
+                if platform.system() == 'Windows':
+                    os.startfile(str(folder))  # noqa: only exists on Windows
+                else:
+                    import subprocess
+                    subprocess.run(['xdg-open', str(folder)], check=True)
                 self.log_message(f"Opened {label.lower()}: {folder}")
             except Exception as e2:
                 self.log_message(f"Could not open {label.lower()}: {e2}")
@@ -13008,7 +13612,35 @@ class SyncApp(Adw.Application):
         if windows:
             windows[0].present()
         else:
-            win = SyncWindow(application=app)
+            try:
+                win = SyncWindow(application=app)
+            except Exception:
+                # If window construction fails, the app must not linger.
+                # GTK/PyGObject can log an exception raised inside a signal
+                # callback like this one without actually unwinding the
+                # process — the main loop that app.run() started keeps
+                # spinning with no window ever shown, invisible in Task
+                # Manager, permanently holding the single-instance mutex
+                # and silently blocking every future launch attempt. That's
+                # exactly what happened during development of this port.
+                import traceback
+                traceback.print_exc()
+                if platform.system() == 'Windows':
+                    try:
+                        import ctypes
+                        ctypes.windll.user32.MessageBoxW(
+                            None,
+                            "RomM - RetroArch Sync failed to start. "
+                            "See the console/log for details, or run "
+                            "RomM-RetroArch-Sync.exe from a terminal to see the full error.",
+                            "RomM - RetroArch Sync — startup error",
+                            0x10  # MB_ICONERROR
+                        )
+                    except Exception:
+                        pass
+                app.quit()
+                sys.exit(1)
+                return
             
             # Handle minimized startup
             if hasattr(app, 'start_minimized') and app.start_minimized:
@@ -13024,6 +13656,33 @@ class SyncApp(Adw.Application):
             if hasattr(window, 'tray'):
                 window.tray.cleanup()
 
+def _windows_single_instance_guard():
+    """True if this is the only running instance, False if another already
+    holds the mutex.
+
+    Adw.Application's own application_id already gives GLib-level
+    single-instance activation on Windows too (GIO has a win32 IPC backend
+    for this, not just D-Bus on Linux) — but that's harder to verify without
+    a real Windows machine to test against, and two instances of a tool that
+    moves save files and ROM libraries around is the kind of failure worth
+    a second, independent guard against. A named kernel mutex is
+    automatically released if the process dies or crashes, so there's no
+    stale-lock cleanup to worry about, unlike a plain lock file.
+    """
+    import ctypes
+    kernel32 = ctypes.windll.kernel32
+    mutex_name = "Global\\RomM-RetroArch-Sync-SingleInstance"
+    mutex = kernel32.CreateMutexW(None, False, mutex_name)
+    ERROR_ALREADY_EXISTS = 183
+    if ctypes.GetLastError() == ERROR_ALREADY_EXISTS:
+        return False
+    # Stash the handle somewhere it won't be garbage-collected (which would
+    # release the mutex early) for the lifetime of the process.
+    global _single_instance_mutex_handle
+    _single_instance_mutex_handle = mutex
+    return True
+
+
 def main():
     """Main entry point"""
     import argparse
@@ -13036,19 +13695,31 @@ def main():
 
     print("🚀 Starting RomM-RetroArch Sync...")
 
-    # GUI mode continues here...
-    # Check desktop environment
-    desktop = os.environ.get('XDG_CURRENT_DESKTOP', 'unknown').lower()
-    print(f"🖥️ Desktop environment: {desktop}")
-    
-    # Check for AppIndicator availability
-    try:
-        gi.require_version('AppIndicator3', '0.1')
-        from gi.repository import AppIndicator3
-        print("✅ AppIndicator3 available")
-    except Exception as e:
-        print(f"⚠️ AppIndicator3 not available: {e}")
-        print("💡 Install libappindicator3-dev for better tray support")
+    if platform.system() == 'Windows':
+        if not _windows_single_instance_guard():
+            print("⚠️ RomM-RetroArch Sync is already running.")
+            return 0
+        # Check for pystray availability (used for the Windows tray icon)
+        try:
+            import pystray
+            print("✅ pystray available")
+        except ImportError as e:
+            print(f"⚠️ pystray not available: {e}")
+            print("💡 Install with: pip install pystray — tray icon will be unavailable without it")
+    else:
+        # GUI mode continues here...
+        # Check desktop environment
+        desktop = os.environ.get('XDG_CURRENT_DESKTOP', 'unknown').lower()
+        print(f"🖥️ Desktop environment: {desktop}")
+
+        # Check for AppIndicator availability
+        try:
+            gi.require_version('AppIndicator3', '0.1')
+            from gi.repository import AppIndicator3
+            print("✅ AppIndicator3 available")
+        except Exception as e:
+            print(f"⚠️ AppIndicator3 not available: {e}")
+            print("💡 Install libappindicator3-dev for better tray support")
     
     app = SyncApp()
     app.start_minimized = args.minimized  # Pass the flag to the app

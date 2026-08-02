@@ -1,57 +1,41 @@
-# RomM - RetroArch Sync
+# RomM - RetroArch Sync (Windows port)
 
-A desktop application for managing your retro game library by syncing ROMs, saves, and save states between RomM server and RetroArch.
+A 1:1 Windows port of [Covin90/romm-retroarch-sync](https://github.com/Covin90/romm-retroarch-sync)
+— same GTK4/libadwaita GUI, same features, running against the same
+`romm_sync_engine` the Linux build uses. Existing Linux behavior is
+untouched; Windows support was added alongside it.
 
-![RomM-RetroArch Sync](assets/screenshots/main_interface.png)
+**Read [`WINDOWS_PORT_NOTES.md`](WINDOWS_PORT_NOTES.md) first.** It documents
+every change made, why, and — importantly — a checklist of the handful of
+things (Task Scheduler behavior, tray icon rendering, toast notifications)
+that were built and tested against real GTK4/libadwaita in a Linux sandbox
+but couldn't be exercised on an actual Windows machine, since none was
+available while building this.
 
-## 📥 Download
+## Quick start
 
-<div align="center">
+1. **Get a GTK4 + libadwaita runtime for Windows** via
+   [gvsbuild](https://github.com/wingtk/gvsbuild) — this is the one genuinely
+   heavy prerequisite; see `WINDOWS_PORT_NOTES.md` → "Packaging" for the
+   exact command (needs the `--enable-gi --py-wheel` flags). One-time setup,
+   not a per-build step.
+2. From the project root (this folder): `set GTK_RUNTIME_DIR=C:\gtk`
+   (or wherever yours landed)
+3. `.\packaging\build_windows.ps1` — run this from the project root too, not
+   from inside `packaging\`.
+4. Run `dist\RomM-RetroArch-Sync\RomM-RetroArch-Sync.exe`, or build a proper
+   installer with `iscc packaging\installer.iss` (needs
+   [Inno Setup](https://jrsoftware.org/isinfo.php)).
 
-[![Download](https://img.shields.io/github/v/release/Covin90/romm-retroarch-sync?style=for-the-badge&logo=github&label=Download%20v1.0.6)](https://github.com/Covin90/romm-retroarch-sync/releases/download/v1.0.6/RomM-RetroArch-Sync-v1.0.6.AppImage)
+## Running from source instead (no build)
 
-**[All Releases](https://github.com/Covin90/romm-retroarch-sync/releases)** • **[Issues](https://github.com/Covin90/romm-retroarch-sync/issues)**
+```
+pip install -r requirements-windows.txt
+python src\romm_sync_app.py
+```
+(Still needs the GTK4 runtime above on `PATH` first — GTK4/PyGObject/
+libadwaita aren't plain `pip install`able on Windows.)
 
-</div>
+## License
 
-## ✨ Features
-
-- **🎮 Game Library Management**: Browse and download your entire RomM game collection
-- **🔄 Auto-Sync**: Automatically sync save files and save states between RetroArch and RomM
-- **🚀 RetroArch Integration**: Launch games directly with appropriate cores
-
-## 🚀 Quick Start
-
-### Download AppImage (Recommended)
-
-1. Download the latest `RomM-RetroArch-Sync.AppImage` from [Releases](../../releases)
-2. Make it executable: `chmod +x RomM-RetroArch-Sync.AppImage`
-3. Run: `./RomM-RetroArch-Sync.AppImage`
-
-## 🔧 Configuration
-
-1. **Connect to RomM**: Enter your RomM server URL and credentials
-2. **Verify RetroArch**: Check that RetroArch installation is detected
-3. **Set Download Path**: Choose where to store downloaded ROMs
-4. **Enable Auto-Sync**: Turn on automatic save file synchronization
-
-## 🔗 Links
-
-- **RomM Project**: [GitHub](https://github.com/rommapp/romm)
-- **RetroArch**: [Official Site](https://www.retroarch.com/)
-
-## 📜 License
-
-This project is licensed under the GNU General Public License v3.0 - see the [LICENSE](LICENSE) file for details.
-
-## 🤝 Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-## 🐛 Bug Reports
-
-Found a bug? Please [open an issue](../../issues) with details about your system and the problem.
-
----
-
-**Note**: This application requires a running RomM server and is designed for personal game library management. Please ensure you own the games you are downloading and managing.
+GPL-3.0, same as the upstream project — see `LICENSE`.
