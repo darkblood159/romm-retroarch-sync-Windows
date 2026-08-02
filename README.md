@@ -8,9 +8,6 @@ untouched; Windows support was added alongside it.
 **Read [`WINDOWS_PORT_NOTES.md`](WINDOWS_PORT_NOTES.md) first.** It documents
 every change made, why, and — importantly — a checklist of the handful of
 things (Task Scheduler behavior, tray icon rendering, toast notifications)
-that were built and tested against real GTK4/libadwaita in a Linux sandbox
-but couldn't be exercised on an actual Windows machine, since none was
-available while building this.
 
 ## Quick start
 
