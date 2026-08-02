@@ -1,6 +1,6 @@
 # RomM - RetroArch Sync (Windows port)
 
-A 1:1 Windows port of [Covin90/romm-retroarch-sync](https://github.com/Covin90/romm-retroarch-sync)
+A Windows port of [Covin90/romm-retroarch-sync](https://github.com/Covin90/romm-retroarch-sync)
 — same GTK4/libadwaita GUI, same features, running against the same
 `romm_sync_engine` the Linux build uses. Existing Linux behavior is
 untouched; Windows support was added alongside it.
